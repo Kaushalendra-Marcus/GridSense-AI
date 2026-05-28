@@ -49,10 +49,14 @@ LGBM_PARAMS = {
 # ─────────────────────────────────────────────
 def load_data():
     print("\n[1/6] Loading data...")
-    train = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
-    test  = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
-    print(f"  Train: {train.shape}  |  Test: {test.shape}")
-    return train, test
+    train_raw = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
+    test      = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
+    print(f"  Raw train: {train_raw.shape}  |  Test: {test.shape}")
+
+    # Test is Day 49 only. Train on Day 49 rows; Day 48 is used only for lag.
+    train = train_raw[train_raw["day"] == 49].reset_index(drop=True)
+    print(f"  Training on Day 49 only: {train.shape}")
+    return train_raw, train, test
 
 
 # ─────────────────────────────────────────────
@@ -108,34 +112,36 @@ def add_geo_features(df):
 # ─────────────────────────────────────────────
 # STEP 2b — FILL MISSING VALUES
 # ─────────────────────────────────────────────
-def fill_missing(train, test):
-    """Handle nulls found in EDA: RoadType (600), Temperature (2495), Weather (797)."""
+def fill_missing(train, test, train_raw=None):
+    """Handle nulls: RoadType (600), Temperature (2495), Weather (797).
+    If train_raw is provided, use it for computing fill statistics
+    so Day 49-only train doesn't lose context from Day 48.
+    """
+    src = train_raw if train_raw is not None else train
 
     # Categorical: fill with mode per geohash prefix, then global mode
     for col in ["RoadType", "Weather"]:
         for df in [train, test]:
             geo_mode = (
-                train.dropna(subset=[col])
+                src.dropna(subset=[col])
                 .groupby("geo_p4")[col]
                 .agg(lambda x: x.mode()[0] if len(x) > 0 else np.nan)
             )
             mask = df[col].isna()
             df.loc[mask, col] = df.loc[mask, "geo_p4"].map(geo_mode)
-            # Global fallback
-            global_mode = train[col].mode()[0]
+            global_mode = src[col].mode()[0]
             df[col].fillna(global_mode, inplace=True)
 
     # Numeric: fill Temperature with geohash+day median, then global median
     for df in [train, test]:
         geo_day_med = (
-            train.dropna(subset=["Temperature"])
+            src.dropna(subset=["Temperature"])
             .groupby(["geohash", "day"])["Temperature"].median()
         )
-        key = list(zip(df["geohash"], df["day"]))
         df["Temperature"] = df["Temperature"].fillna(
             df.apply(lambda r: geo_day_med.get((r["geohash"], r["day"]), np.nan), axis=1)
         )
-        global_temp_med = train["Temperature"].median()
+        global_temp_med = src["Temperature"].median()
         df["Temperature"].fillna(global_temp_med, inplace=True)
 
     return train, test
@@ -144,39 +150,26 @@ def fill_missing(train, test):
 # ─────────────────────────────────────────────
 # STEP 4 — LAG FEATURE
 # ─────────────────────────────────────────────
-def add_lag_features(train, test):
+def add_lag_features(train_raw, train, test):
     """
-    Train has Day 48 and Day 49. Test is also Day 49.
-    For Day 49 train rows: use Day 48 same geohash+timestamp as lag.
-    For test rows: same — use Day 48 demand as lag feature.
-    Day 48 train rows get NaN lag (filled by geohash median fallback).
+    Day 48 rows from train_raw are used purely as a lag source.
+    train (Day 49 only) and test (Day 49) both get demand_d48
+    from the matching geohash + timestamp in Day 48.
     """
     print("\n[3/6] Building lag features...")
 
-    # Both train and test are Day 49 — no prior day exists in test to lag from.
-    # Instead, use Day 48 train data as a lag source for Day 49 train rows,
-    # and for test use the geohash+timestamp mean from Day 48 as a proxy.
-
-    day48 = (train[train["day"] == 48][["geohash", "timestamp", "demand"]]
+    day48 = (train_raw[train_raw["day"] == 48][["geohash", "timestamp", "demand"]]
              .rename(columns={"demand": "demand_d48"}))
 
-    day49_train = train[train["day"] == 49].copy()
-    day48_train = train[train["day"] == 48].copy()
+    # Merge lag onto Day 49 train and test
+    train = train.merge(day48[["geohash", "timestamp", "demand_d48"]],
+                        on=["geohash", "timestamp"], how="left")
+    test  = test.merge(day48[["geohash", "timestamp", "demand_d48"]],
+                       on=["geohash", "timestamp"], how="left")
 
-    # For Day 49 train rows: merge Day 48 demand as lag
-    day49_train = day49_train.merge(day48[["geohash", "timestamp", "demand_d48"]],
-                                    on=["geohash", "timestamp"], how="left")
-    # For Day 48 train rows: no prior day available, fill with geohash mean
-    day48_train["demand_d48"] = np.nan
-
-    train = pd.concat([day48_train, day49_train], ignore_index=True)
-
-    # For test (Day 49): use Day 48 demand as lag
-    test = test.merge(day48[["geohash", "timestamp", "demand_d48"]],
-                      on=["geohash", "timestamp"], how="left")
-
-    lag_coverage = test["demand_d48"].notna().mean() * 100
-    print(f"  Day-48 lag coverage on test: {lag_coverage:.1f}%")
+    train_cov = train["demand_d48"].notna().mean() * 100
+    test_cov  = test["demand_d48"].notna().mean()  * 100
+    print(f"  Lag coverage  train: {train_cov:.1f}%  |  test: {test_cov:.1f}%")
 
     # Fill NaN lag with per-geohash median demand from Day 48
     geo_median = day48.groupby("geohash")["demand_d48"].median()
@@ -395,18 +388,20 @@ def main():
     print("  GRIDLOCK HACKATHON 2.0 — Traffic Demand Prediction")
     print("=" * 55)
 
-    train, test = load_data()
+    train_raw, train, test = load_data()
 
     print("\n[2/6] Feature engineering...")
+    train_raw = add_temporal_features(train_raw)
+    train_raw = add_geo_features(train_raw)
     train = add_temporal_features(train)
     test  = add_temporal_features(test)
     train = add_geo_features(train)
     test  = add_geo_features(test)
-    train, test = fill_missing(train, test)
+    train, test = fill_missing(train, test, train_raw=train_raw)
 
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
-    train, test = add_lag_features(train, test)
+    train, test = add_lag_features(train_raw, train, test)
     train, test = add_target_encoding(train, test, kf)
     train, test = add_aggregate_stats(train, test)
     train, test, encoders = encode_categoricals(train, test)
