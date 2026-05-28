@@ -213,10 +213,10 @@ def add_aggregate_stats(train, test):
         train = train.merge(stats, on=key, how="left")
         test  = test.merge(stats,  on=key, how="left")
 
-    # Fill any NaN from unseen values
-    num_cols = train.select_dtypes(include=[np.number]).columns
-    train[num_cols] = train[num_cols].fillna(train[num_cols].median())
-    test[num_cols]  = test[num_cols].fillna(train[num_cols].median())
+    # Fill any NaN from unseen values using train medians
+    train_medians = train.select_dtypes(include=[np.number]).median()
+    train = train.fillna(train_medians)
+    test  = test.fillna(train_medians)
 
     return train, test
 
@@ -307,9 +307,10 @@ def main():
     train, test = load_data()
 
     print("\n[2/6] Feature engineering...")
-    for df in [train, test]:
-        add_temporal_features(df)
-        add_geo_features(df)
+    train = add_temporal_features(train)
+    test  = add_temporal_features(test)
+    train = add_geo_features(train)
+    test  = add_geo_features(test)
 
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 

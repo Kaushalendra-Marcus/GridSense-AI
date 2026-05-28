@@ -61,7 +61,7 @@ python eda.py
 ```
 
 **What to look for:**
-- `Day-48 lag coverage` → if it says ✅ HIGH (>80%), the lag feature is your golden predictor
+- `Day-48 lag coverage` — if it says [HIGH] (>80%), the lag feature is your golden predictor
 - Any missing values in key columns
 - What days are in train vs test
 
@@ -153,6 +153,6 @@ This shows which features mattered most. Typically:
 |---|---|
 | `ModuleNotFoundError: lightgbm` | `pip install lightgbm` |
 | `FileNotFoundError: data/train.csv` | Make sure files are in the `data/` folder |
-| Low score (<85) | Check `eda.py` output — lag coverage might be low |
+| Low score (<85) | Check `eda.py` output -- lag coverage might be low |
 | OOM / slow | Reduce `n_estimators` to 1000 in `train.py` LGBM_PARAMS |
 | pygeohash missing | Install it: `pip install pygeohash` (optional, not required) |

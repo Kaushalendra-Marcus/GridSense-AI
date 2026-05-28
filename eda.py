@@ -61,11 +61,11 @@ def main():
         print(f"  Test rows that match Day-{max_train_day} (geohash+timestamp): "
               f"{len(overlap_keys)} / {len(test)} ({pct:.1f}%)")
         if pct > 80:
-            print("  ✅ HIGH overlap → demand_d48 will be VERY powerful")
+            print("  [HIGH] overlap → demand_d48 will be VERY powerful")
         elif pct > 30:
-            print("  ⚠️  MEDIUM overlap → lag helps but needs fallback")
+            print("  [MEDIUM] overlap → lag helps but needs fallback")
         else:
-            print("  ❌ LOW overlap → lag feature has limited value; use target encoding")
+            print("  [LOW] overlap → lag feature has limited value; use target encoding")
     else:
         print("  No 'day' column in test — cannot check lag coverage")
 

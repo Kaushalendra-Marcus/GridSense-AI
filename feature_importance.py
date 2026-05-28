@@ -14,7 +14,7 @@ MODEL_DIR = "models"
 def main():
     path = os.path.join(MODEL_DIR, "lgbm_models.pkl")
     if not os.path.exists(path):
-        print("❌ No models found. Run train.py first.")
+        print("[ERROR] No models found. Run train.py first.")
         return
 
     with open(path, "rb") as f:
