@@ -1,158 +1,131 @@
-# Gridlock Hackathon 2.0 — Traffic Demand Prediction
-## Complete Solution Guide
+# Traffic Demand Prediction
+
+A LightGBM-based solution for predicting normalized traffic demand across locations and time slots, built for the Gridlock Hackathon 2.0 (Flipkart).
+
+OOF R2 Score: **95.63 / 100**
 
 ---
 
-## Folder Structure
+## Project Structure
 
 ```
 gridlock_solution/
-│
-├── data/                   ← PUT YOUR DATA FILES HERE
+├── data/                    # Input data files (not tracked)
 │   ├── train.csv
 │   ├── test.csv
 │   └── sample_submission.csv
-│
-├── models/                 ← Auto-created — saved model files
-├── outputs/                ← Auto-created — submission.csv goes here
-├── logs/                   ← Auto-created — optional logs
-│
-├── train.py                ← MAIN script (run this)
-├── eda.py                  ← Optional: explore data first
-├── feature_importance.py   ← Optional: view top features after training
-├── requirements.txt
-└── README.md
+├── models/                  # Saved model artifacts (auto-created)
+├── outputs/                 # Prediction files (auto-created)
+├── train.py                 # Main training pipeline
+├── eda.py                   # Data exploration and lag coverage check
+├── feature_importance.py    # Feature importance from saved models
+└── requirements.txt
 ```
 
 ---
 
-## Step-by-Step: How to Train
-
-### Step 0 — Setup (one time only)
+## Setup
 
 ```bash
-# Go into the project folder
-cd gridlock_solution
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
----
-
-### Step 1 — Add Your Data
-
-Download the dataset from HackerEarth and place all 3 files inside the `data/` folder:
-
-```
-data/train.csv
-data/test.csv
-data/sample_submission.csv
-```
+Place the dataset files in the `data/` folder before running anything.
 
 ---
 
-### Step 2 — (Optional) Run EDA First
+## Usage
 
-This checks if the Day-48 lag feature will work well on your data.
+### 1. Explore the data (optional)
 
 ```bash
 python eda.py
 ```
 
-**What to look for:**
-- `Day-48 lag coverage` — if it says [HIGH] (>80%), the lag feature is your golden predictor
-- Any missing values in key columns
-- What days are in train vs test
+Prints dataset statistics, missing value counts, day/timestamp distribution, geohash coverage, and Day-48 lag overlap between train and test.
 
----
-
-### Step 3 — Train the Model
+### 2. Train
 
 ```bash
 python train.py
 ```
 
-**What happens:**
-1. Loads train.csv and test.csv
-2. Engineers 30+ features (temporal, geo, lag, target encoding, aggregates)
-3. Trains LightGBM with 5-fold cross-validation
-4. Prints fold scores in real-time
-5. Saves models to `models/lgbm_models.pkl`
-6. Saves predictions to `outputs/submission.csv`
+Runs the full pipeline and writes predictions to `outputs/submission.csv`.
 
-**Expected output:**
-```
-=======================================================
-  GRIDLOCK HACKATHON 2.0 — Traffic Demand Prediction
-=======================================================
-[1/6] Loading data...
-  Train: (77299, 11)  |  Test: (41778, 10)
-
-[2/6] Feature engineering...
-[3/6] Building lag features...
-  Day-lag coverage on test: 98.7%
-[4/6] Target encoding (OOF)...
-[5/6] Aggregate statistics...
-[6/6] Training LightGBM (5-fold CV)...
-  Features: 38
-
-  Fold 1 | Score: 96.21 | Trees: 847 | Time: 42.3s
-  Fold 2 | Score: 95.87 | Trees: 912 | Time: 38.1s
-  Fold 3 | Score: 96.44 | Trees: 788 | Time: 40.2s
-  Fold 4 | Score: 95.93 | Trees: 903 | Time: 41.0s
-  Fold 5 | Score: 96.11 | Trees: 856 | Time: 39.5s
-
-  ── OOF Score: 96.11 ──
-
-  Models saved → models/lgbm_models.pkl
-  Submission saved → outputs/submission.csv  shape: (41778, 2)
-  Total time: 3.4 min
-=======================================================
-```
-
-**Expected score range:** 93–99 depending on lag coverage
-
----
-
-### Step 4 — (Optional) Check Feature Importance
+### 3. Inspect feature importance (optional)
 
 ```bash
 python feature_importance.py
 ```
 
-This shows which features mattered most. Typically:
-1. `demand_d48` (lag feature) — highest by far if coverage is good
-2. `geohash_x_time_slot_enc` (interaction target encoding)
-3. `geohash_mean` / `geohash_median` (location-level aggregates)
+Prints and saves a ranked feature importance table from the trained models.
 
 ---
 
-### Step 5 — Submit
+## Pipeline Overview
 
-1. Go to the HackerEarth problem page
-2. Under **Upload Prediction File** → choose `outputs/submission.csv`
-3. Under **Upload Source Code** → zip your `.ipynb` or this folder and upload
-4. Click **Submit & Evaluate**
+The pipeline runs in 6 stages:
+
+**1. Load** — reads `train.csv` and `test.csv`.
+
+**2. Feature engineering** — extracts temporal features (hour, minute, 15-minute time slot, peak/night flags, cyclical sin/cos encodings for hour, time slot, and day), spatial features (geohash prefix hierarchy at levels 3-6, decoded lat/lon), and fills missing values in `RoadType`, `Weather`, and `Temperature` using geo-prefix mode and median fallbacks.
+
+**3. Lag feature** — joins Day 48 demand onto Day 49 train rows and test rows by `geohash + timestamp`. Rows with no match are filled using geo-prefix + timestamp median, then timestamp median, then global median. Final NaN count is zero.
+
+**4. Target encoding (OOF)** -- encodes 9 group keys using out-of-fold means to prevent leakage: `geohash`, `geo_p4`, `geohash x time_slot`, `geohash x day`, `geo_p4 x time_slot`, `day x time_slot`, `RoadType x time_slot`, `geohash x is_peak`, `Weather x time_slot`.
+
+**5. Aggregate statistics** -- computes per-group demand statistics (mean, std, median, max, min) for `geohash`, `time_slot`, `geo_p4`, `RoadType`, `NumberofLanes`, and `Weather`. Also derives `lag / geo_mean ratio`, `lag - geo_median`, and a coarse temperature bin.
+
+**6. Train** -- fits LightGBM with 5-fold cross-validation. Predictions are averaged across folds. Models and feature columns are saved to `models/lgbm_models.pkl`.
 
 ---
 
-## Key Ideas in This Solution
+## Features (49 total)
 
-| Feature | Why It Helps |
+| Group | Features |
 |---|---|
-| `demand_d48` | Test data is Day 49; Day 48 same location+time is nearly identical |
-| `geohash × time_slot encoding` | Captures rush-hour patterns specific to each location |
-| Cyclical sin/cos time | Midnight and 23:45 are "close" — avoids discontinuity |
-| Geohash prefixes (p3–p6) | Hierarchical spatial grouping for fallback encoding |
-| Per-location aggregates | Baseline demand level at each location |
+| Temporal | `time_slot`, `is_peak`, `is_night`, `sin/cos` encodings for hour, slot, day |
+| Spatial | `geo_p3/4/5/6`, `lat`, `lon` |
+| Lag | `demand_d48`, `lag_to_geo_mean_ratio`, `lag_minus_geo_median` |
+| Target encoded | 9 interaction encodings (OOF) |
+| Aggregate stats | 13 group-level demand statistics |
+| Raw | `day`, `RoadType`, `NumberofLanes`, `LargeVehicles`, `Landmarks`, `Temperature`, `Weather`, `temp_bin` |
+
+---
+
+## Model
+
+LightGBM regressor, 5-fold CV, optimized for R2 score.
+
+```
+n_estimators:      5000 (with early stopping, patience=200)
+learning_rate:     0.02
+num_leaves:        255
+min_child_samples: 15
+subsample:         0.75
+colsample_bytree:  0.75
+reg_alpha:         0.05
+reg_lambda:        0.10
+```
+
+---
+
+## Submission
+
+The output file `outputs/submission.csv` contains two columns: `Index` and `demand` (41778 rows).
+
+To submit on HackerEarth:
+1. Go to the problem page and scroll to **Upload Prediction File**
+2. Select `outputs/submission.csv` and click **Submit & Evaluate**
+3. Under **Upload Source Code**, upload a zip of this folder
+
+---
 
 ## Troubleshooting
 
-| Problem | Fix |
+| Error | Fix |
 |---|---|
 | `ModuleNotFoundError: lightgbm` | `pip install lightgbm` |
-| `FileNotFoundError: data/train.csv` | Make sure files are in the `data/` folder |
-| Low score (<85) | Check `eda.py` output -- lag coverage might be low |
-| OOM / slow | Reduce `n_estimators` to 1000 in `train.py` LGBM_PARAMS |
-| pygeohash missing | Install it: `pip install pygeohash` (optional, not required) |
+| `FileNotFoundError: data/train.csv` | Place dataset files in the `data/` folder |
+| `pygeohash` not found | `pip install pygeohash` -- optional, skipped automatically if missing |
+| Slow training / OOM | Lower `n_estimators` to 2000 and `num_leaves` to 127 in `LGBM_PARAMS` |
