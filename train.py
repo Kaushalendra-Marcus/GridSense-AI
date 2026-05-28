@@ -26,21 +26,22 @@ N_FOLDS     = 5
 SEED        = 42
 
 LGBM_PARAMS = {
-    "objective":        "regression",
-    "metric":           "rmse",
-    "n_estimators":     3000,
-    "learning_rate":    0.03,
-    "num_leaves":       127,
-    "max_depth":        -1,
-    "min_child_samples": 20,
-    "subsample":        0.8,
-    "subsample_freq":   1,
-    "colsample_bytree": 0.8,
-    "reg_alpha":        0.1,
-    "reg_lambda":       0.2,
-    "random_state":     SEED,
-    "n_jobs":           -1,
-    "verbose":          -1,
+    "objective":         "regression",
+    "metric":            "rmse",
+    "n_estimators":      5000,
+    "learning_rate":     0.02,
+    "num_leaves":        255,
+    "max_depth":         -1,
+    "min_child_samples": 15,
+    "subsample":         0.75,
+    "subsample_freq":    1,
+    "colsample_bytree":  0.75,
+    "reg_alpha":         0.05,
+    "reg_lambda":        0.1,
+    "min_split_gain":    0.001,
+    "random_state":      SEED,
+    "n_jobs":            -1,
+    "verbose":           -1,
 }
 
 # ─────────────────────────────────────────────
@@ -182,6 +183,23 @@ def add_lag_features(train, test):
     train["demand_d48"] = train["demand_d48"].fillna(train["geohash"].map(geo_median))
     test["demand_d48"]  = test["demand_d48"].fillna(test["geohash"].map(geo_median))
 
+    # Fallback 2: per-geo_p4-prefix + timestamp median
+    day48["geo_p4"] = day48["geohash"].astype(str).str[:4]
+    geo_p4_ts_med = day48.groupby(["geo_p4", "timestamp"])["demand_d48"].median()
+    for df in [train, test]:
+        mask = df["demand_d48"].isna()
+        if mask.any():
+            df.loc[mask, "demand_d48"] = df.loc[mask].apply(
+                lambda r: geo_p4_ts_med.get((r["geohash"][:4], r["timestamp"]), np.nan), axis=1
+            )
+
+    # Fallback 3: per-timestamp median across all Day 48
+    ts_med = day48.groupby("timestamp")["demand_d48"].median()
+    for df in [train, test]:
+        mask = df["demand_d48"].isna()
+        if mask.any():
+            df.loc[mask, "demand_d48"] = df.loc[mask, "timestamp"].map(ts_med)
+
     # Final fallback: global median
     global_med = day48["demand_d48"].median()
     train["demand_d48"].fillna(global_med, inplace=True)
@@ -207,10 +225,13 @@ def add_target_encoding(train, test, kf):
     encode_keys = [
         "geohash",
         "geo_p4",
-        ("geohash", "time_slot"),    # ← THE KEY FEATURE
-        ("geohash", "day"),
-        ("geo_p4",  "time_slot"),
-        ("day",     "time_slot"),
+        ("geohash",   "time_slot"),   # location x time: key feature
+        ("geohash",   "day"),
+        ("geo_p4",    "time_slot"),
+        ("day",       "time_slot"),
+        ("RoadType",  "time_slot"),   # road type behaves differently at peak vs off-peak
+        ("geohash",   "is_peak"),     # location-specific peak demand signature
+        ("Weather",   "time_slot"),   # weather interacts with time of day
     ]
 
     global_mean = target.mean()
@@ -253,10 +274,12 @@ def add_aggregate_stats(train, test):
     print("\n[5/6] Aggregate statistics...")
 
     agg_configs = [
-        ("geohash",   ["mean", "std", "median", "max", "min"]),
-        ("time_slot", ["mean", "std"]),
-        ("geo_p4",    ["mean", "std"]),
-        ("RoadType",  ["mean"]),
+        ("geohash",        ["mean", "std", "median", "max", "min"]),
+        ("time_slot",      ["mean", "std"]),
+        ("geo_p4",         ["mean", "std"]),
+        ("RoadType",       ["mean"]),
+        ("NumberofLanes",  ["mean", "std"]),
+        ("Weather",        ["mean"]),
     ]
 
     for key, aggs in agg_configs:
@@ -266,6 +289,20 @@ def add_aggregate_stats(train, test):
                  .reset_index())
         train = train.merge(stats, on=key, how="left")
         test  = test.merge(stats,  on=key, how="left")
+
+    # Derived ratio: how does this location's lag compare to its own baseline
+    # Avoids division by zero with a small epsilon
+    eps = 1e-6
+    for df in [train, test]:
+        df["lag_to_geo_mean_ratio"] = df["demand_d48"] / (df["geohash_mean"] + eps)
+        df["lag_minus_geo_median"]  = df["demand_d48"] - df["geohash_median"]
+
+        # Temperature bin (coarse: cold / mild / warm / hot)
+        df["temp_bin"] = pd.cut(
+            df["Temperature"],
+            bins=[-999, 15, 22, 30, 999],
+            labels=[0, 1, 2, 3]
+        ).astype(float)
 
     # Fill any NaN from unseen values using train medians
     train_medians = train.select_dtypes(include=[np.number]).median()
@@ -323,7 +360,7 @@ def train_and_predict(train, test, kf):
             X.iloc[tr_idx], y.iloc[tr_idx],
             eval_set=[(X.iloc[val_idx], y.iloc[val_idx])],
             callbacks=[
-                lgb.early_stopping(150, verbose=False),
+                lgb.early_stopping(200, verbose=False),
                 lgb.log_evaluation(500),
             ],
         )
