@@ -28,7 +28,7 @@ SEED        = 42
 LGBM_PARAMS = {
     "objective":         "regression",
     "metric":            "rmse",
-    "n_estimators":      5000,
+    "n_estimators":      8000,
     "learning_rate":     0.02,
     "num_leaves":        255,
     "max_depth":         -1,
