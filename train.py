@@ -105,36 +105,90 @@ def add_geo_features(df):
 
 
 # ─────────────────────────────────────────────
-# STEP 4 — LAG FEATURE (Day-48 golden feature)
+# STEP 2b — FILL MISSING VALUES
+# ─────────────────────────────────────────────
+def fill_missing(train, test):
+    """Handle nulls found in EDA: RoadType (600), Temperature (2495), Weather (797)."""
+
+    # Categorical: fill with mode per geohash prefix, then global mode
+    for col in ["RoadType", "Weather"]:
+        for df in [train, test]:
+            geo_mode = (
+                train.dropna(subset=[col])
+                .groupby("geo_p4")[col]
+                .agg(lambda x: x.mode()[0] if len(x) > 0 else np.nan)
+            )
+            mask = df[col].isna()
+            df.loc[mask, col] = df.loc[mask, "geo_p4"].map(geo_mode)
+            # Global fallback
+            global_mode = train[col].mode()[0]
+            df[col].fillna(global_mode, inplace=True)
+
+    # Numeric: fill Temperature with geohash+day median, then global median
+    for df in [train, test]:
+        geo_day_med = (
+            train.dropna(subset=["Temperature"])
+            .groupby(["geohash", "day"])["Temperature"].median()
+        )
+        key = list(zip(df["geohash"], df["day"]))
+        df["Temperature"] = df["Temperature"].fillna(
+            df.apply(lambda r: geo_day_med.get((r["geohash"], r["day"]), np.nan), axis=1)
+        )
+        global_temp_med = train["Temperature"].median()
+        df["Temperature"].fillna(global_temp_med, inplace=True)
+
+    return train, test
+
+
+# ─────────────────────────────────────────────
+# STEP 4 — LAG FEATURE
 # ─────────────────────────────────────────────
 def add_lag_features(train, test):
     """
-    Key insight: test timestamps are Day 49 which mirrors Day 48 in train.
-    demand_d48 = demand at same geohash + timestamp one day earlier.
-    This is the single strongest predictor.
+    Train has Day 48 and Day 49. Test is also Day 49.
+    For Day 49 train rows: use Day 48 same geohash+timestamp as lag.
+    For test rows: same — use Day 48 demand as lag feature.
+    Day 48 train rows get NaN lag (filled by geohash median fallback).
     """
     print("\n[3/6] Building lag features...")
 
-    # Day-48 lookup: geohash × timestamp → demand
-    day48 = (train[train["day"] == train["day"].max()]
-             [["geohash", "timestamp", "demand"]]
+    # Both train and test are Day 49 — no prior day exists in test to lag from.
+    # Instead, use Day 48 train data as a lag source for Day 49 train rows,
+    # and for test use the geohash+timestamp mean from Day 48 as a proxy.
+
+    day48 = (train[train["day"] == 48][["geohash", "timestamp", "demand"]]
              .rename(columns={"demand": "demand_d48"}))
 
-    test = test.merge(day48, on=["geohash", "timestamp"], how="left")
+    day49_train = train[train["day"] == 49].copy()
+    day48_train = train[train["day"] == 48].copy()
+
+    # For Day 49 train rows: merge Day 48 demand as lag
+    day49_train = day49_train.merge(day48[["geohash", "timestamp", "demand_d48"]],
+                                    on=["geohash", "timestamp"], how="left")
+    # For Day 48 train rows: no prior day available, fill with geohash mean
+    day48_train["demand_d48"] = np.nan
+
+    train = pd.concat([day48_train, day49_train], ignore_index=True)
+
+    # For test (Day 49): use Day 48 demand as lag
+    test = test.merge(day48[["geohash", "timestamp", "demand_d48"]],
+                      on=["geohash", "timestamp"], how="left")
+
     lag_coverage = test["demand_d48"].notna().mean() * 100
-    print(f"  Day-lag coverage on test: {lag_coverage:.1f}%")
+    print(f"  Day-48 lag coverage on test: {lag_coverage:.1f}%")
 
-    # For train: lag = previous day's demand at same geohash+timestamp
-    all_days = sorted(train["day"].unique())
-    day_map  = {d: i for i, d in enumerate(all_days)}
-    train["_day_idx"] = train["day"].map(day_map)
+    # Fill NaN lag with per-geohash median demand from Day 48
+    geo_median = day48.groupby("geohash")["demand_d48"].median()
+    train["demand_d48"] = train["demand_d48"].fillna(train["geohash"].map(geo_median))
+    test["demand_d48"]  = test["demand_d48"].fillna(test["geohash"].map(geo_median))
 
-    lag_df = (train[["geohash", "timestamp", "_day_idx", "demand"]]
-              .copy()
-              .assign(_day_idx=lambda x: x["_day_idx"] + 1)   # shift by 1
-              .rename(columns={"demand": "demand_d48"}))
-    train = train.merge(lag_df, on=["geohash", "timestamp", "_day_idx"], how="left")
-    train.drop(columns=["_day_idx"], inplace=True)
+    # Final fallback: global median
+    global_med = day48["demand_d48"].median()
+    train["demand_d48"].fillna(global_med, inplace=True)
+    test["demand_d48"].fillna(global_med, inplace=True)
+
+    print(f"  After fallback — NaN in train lag: {train['demand_d48'].isna().sum()}")
+    print(f"  After fallback — NaN in test  lag: {test['demand_d48'].isna().sum()}")
 
     return train, test
 
@@ -311,6 +365,7 @@ def main():
     test  = add_temporal_features(test)
     train = add_geo_features(train)
     test  = add_geo_features(test)
+    train, test = fill_missing(train, test)
 
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
