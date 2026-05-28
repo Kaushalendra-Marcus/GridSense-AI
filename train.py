@@ -28,17 +28,17 @@ SEED        = 42
 LGBM_PARAMS = {
     "objective":         "regression",
     "metric":            "rmse",
-    "n_estimators":      8000,
+    "n_estimators":      3000,
     "learning_rate":     0.02,
-    "num_leaves":        255,
-    "max_depth":         -1,
-    "min_child_samples": 15,
-    "subsample":         0.75,
+    "num_leaves":        31,
+    "max_depth":         6,
+    "min_child_samples": 20,
+    "subsample":         0.8,
     "subsample_freq":    1,
-    "colsample_bytree":  0.75,
-    "reg_alpha":         0.05,
-    "reg_lambda":        0.1,
-    "min_split_gain":    0.001,
+    "colsample_bytree":  0.7,
+    "reg_alpha":         0.1,
+    "reg_lambda":        1.0,
+    "min_split_gain":    0.01,
     "random_state":      SEED,
     "n_jobs":            -1,
     "verbose":           -1,
@@ -53,9 +53,13 @@ def load_data():
     test      = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
     print(f"  Raw train: {train_raw.shape}  |  Test: {test.shape}")
 
-    # Test is Day 49 only. Train on Day 49 rows; Day 48 is used only for lag.
-    train = train_raw[train_raw["day"] == 49].reset_index(drop=True)
-    print(f"  Training on Day 49 only: {train.shape}")
+    # KEY INSIGHT:
+    # - Day 49 train has timestamps 0:00-2:00 (9 slots) → ZERO overlap with test (2:15-13:45)
+    # - Day 48 train has ALL 96 timestamps → covers all 47 test timestamps perfectly
+    # Strategy: train on Day 48 (primary) + Day 49 (supplement)
+    train = train_raw.copy().reset_index(drop=True)
+    print(f"  Training on ALL days (48+49): {train.shape}")
+    print(f"  Day 48: {(train_raw['day']==48).sum()} rows | Day 49: {(train_raw['day']==49).sum()} rows")
     return train_raw, train, test
 
 
@@ -152,51 +156,71 @@ def fill_missing(train, test, train_raw=None):
 # ─────────────────────────────────────────────
 def add_lag_features(train_raw, train, test):
     """
-    Day 48 rows from train_raw are used purely as a lag source.
-    train (Day 49 only) and test (Day 49) both get demand_d48
-    from the matching geohash + timestamp in Day 48.
+    Build lag features:
+    1. demand_d48: same geohash+timestamp from Day 48 (cross-day lag for test)
+    2. demand_prev_slot: same geohash, previous timeslot within same day (for train)
+       For test, use Day 48's same geohash+timestamp as the prev-slot proxy.
     """
     print("\n[3/6] Building lag features...")
 
+    # — Lag 1: Day 48 demand at same geohash+timestamp (key predictor for test)
     day48 = (train_raw[train_raw["day"] == 48][["geohash", "timestamp", "demand"]]
              .rename(columns={"demand": "demand_d48"}))
 
-    # Merge lag onto Day 49 train and test
     train = train.merge(day48[["geohash", "timestamp", "demand_d48"]],
                         on=["geohash", "timestamp"], how="left")
+    # Avoid leakage: Day 48 rows seeing their own demand as lag
+    train.loc[train["day"] == 48, "demand_d48"] = np.nan
     test  = test.merge(day48[["geohash", "timestamp", "demand_d48"]],
                        on=["geohash", "timestamp"], how="left")
 
     train_cov = train["demand_d48"].notna().mean() * 100
     test_cov  = test["demand_d48"].notna().mean()  * 100
-    print(f"  Lag coverage  train: {train_cov:.1f}%  |  test: {test_cov:.1f}%")
+    print(f"  demand_d48 coverage  train: {train_cov:.1f}%  |  test: {test_cov:.1f}%")
 
-    # Fill NaN lag with per-geohash median demand from Day 48
+    # Fill NaN demand_d48 with per-geohash median, then geo_p4+timestamp, then global
     geo_median = day48.groupby("geohash")["demand_d48"].median()
     train["demand_d48"] = train["demand_d48"].fillna(train["geohash"].map(geo_median))
     test["demand_d48"]  = test["demand_d48"].fillna(test["geohash"].map(geo_median))
 
-    # Fallback 2: per-geo_p4-prefix + timestamp median
     day48["geo_p4"] = day48["geohash"].astype(str).str[:4]
     geo_p4_ts_med = day48.groupby(["geo_p4", "timestamp"])["demand_d48"].median()
+    ts_med        = day48.groupby("timestamp")["demand_d48"].median()
+    global_med    = day48["demand_d48"].median()
+
     for df in [train, test]:
         mask = df["demand_d48"].isna()
         if mask.any():
             df.loc[mask, "demand_d48"] = df.loc[mask].apply(
-                lambda r: geo_p4_ts_med.get((r["geohash"][:4], r["timestamp"]), np.nan), axis=1
+                lambda r: geo_p4_ts_med.get(
+                    (r["geo_p4"] if "geo_p4" in r.index else r["geohash"][:4], r["timestamp"]), np.nan
+                ), axis=1
             )
-
-    # Fallback 3: per-timestamp median across all Day 48
-    ts_med = day48.groupby("timestamp")["demand_d48"].median()
-    for df in [train, test]:
         mask = df["demand_d48"].isna()
         if mask.any():
             df.loc[mask, "demand_d48"] = df.loc[mask, "timestamp"].map(ts_med)
+        df["demand_d48"].fillna(global_med, inplace=True)
 
-    # Final fallback: global median
-    global_med = day48["demand_d48"].median()
-    train["demand_d48"].fillna(global_med, inplace=True)
-    test["demand_d48"].fillna(global_med, inplace=True)
+    # — Lag 2: previous timeslot demand within Day 48 (for train rows on day 48)
+    # Sort day48 by geohash + time_slot order, shift by 1
+    ts_order = (
+        train_raw[train_raw["day"] == 48][["geohash", "timestamp", "demand", "time_slot"]]
+        .sort_values(["geohash", "time_slot"])
+    )
+    ts_order["demand_prev_slot"] = ts_order.groupby("geohash")["demand"].shift(1)
+    prev_slot_map = ts_order.set_index(["geohash", "timestamp"])["demand_prev_slot"]
+
+    train["demand_prev_slot"] = train.apply(
+        lambda r: prev_slot_map.get((r["geohash"], r["timestamp"]), np.nan), axis=1
+    )
+    # For test: same mapping from day48 previous-slot
+    test["demand_prev_slot"] = test.apply(
+        lambda r: prev_slot_map.get((r["geohash"], r["timestamp"]), np.nan), axis=1
+    )
+
+    # Fill NaN prev_slot with demand_d48 (best available proxy)
+    train["demand_prev_slot"].fillna(train["demand_d48"], inplace=True)
+    test["demand_prev_slot"].fillna(test["demand_d48"],   inplace=True)
 
     print(f"  After fallback — NaN in train lag: {train['demand_d48'].isna().sum()}")
     print(f"  After fallback — NaN in test  lag: {test['demand_d48'].isna().sum()}")
@@ -207,54 +231,60 @@ def add_lag_features(train_raw, train, test):
 # ─────────────────────────────────────────────
 # STEP 5 — TARGET ENCODING (fold-safe)
 # ─────────────────────────────────────────────
-def add_target_encoding(train, test, kf):
+def add_target_encoding(train, test, kf, train_raw=None):
     """
-    Encode geohash × time_slot interaction using OOF strategy.
-    Also encode geohash, geo_p4, day × time_slot.
+    OOF encoding on Day 49 train rows.
+    Test mapping uses train_raw (both days) for richer coverage.
     """
     print("\n[4/6] Target encoding (OOF)...")
-    target = train["demand"]
+    target      = train["demand"]
+    global_mean = target.mean()
+    src         = train_raw if train_raw is not None else train
 
     encode_keys = [
         "geohash",
         "geo_p4",
-        ("geohash",   "time_slot"),   # location x time: key feature
-        ("geohash",   "day"),
-        ("geo_p4",    "time_slot"),
-        ("day",       "time_slot"),
-        ("RoadType",  "time_slot"),   # road type behaves differently at peak vs off-peak
-        ("geohash",   "is_peak"),     # location-specific peak demand signature
-        ("Weather",   "time_slot"),   # weather interacts with time of day
+        ("geohash",  "time_slot"),
+        ("geohash",  "day"),
+        ("geo_p4",   "time_slot"),
+        ("day",      "time_slot"),
+        ("RoadType", "time_slot"),
+        ("geohash",  "is_peak"),
+        ("Weather",  "time_slot"),
     ]
-
-    global_mean = target.mean()
 
     for key in encode_keys:
         if isinstance(key, tuple):
             col_name = "_x_".join(key) + "_enc"
-            train["_key"] = train[list(key)].astype(str).agg("_".join, axis=1)
-            test["_key"]  = test[list(key)].astype(str).agg("_".join, axis=1)
+            def make_key(df, cols):
+                return df[cols].fillna(-1).astype(str).agg("_".join, axis=1)
+            train["_key"] = make_key(train, list(key))
+            test["_key"]  = make_key(test,  list(key))
+            src["_key"]   = make_key(src,   list(key))
         else:
             col_name = key + "_enc"
             train["_key"] = train[key].astype(str)
             test["_key"]  = test[key].astype(str)
+            src["_key"]   = src[key].astype(str)
 
         train[col_name] = np.nan
 
-        for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(train)):
+        # OOF on Day 49 train
+        for _, (tr_idx, val_idx) in enumerate(kf.split(train)):
             mapping = train.iloc[tr_idx].groupby("_key")["demand"].mean()
             train.loc[val_idx, col_name] = train.loc[val_idx, "_key"].map(mapping)
 
-        # Full mapping for test
-        full_map = train.groupby("_key")["demand"].mean()
+        # Test mapping from full data (both days)
+        full_map = src.groupby("_key")["demand"].mean()
         test[col_name] = test["_key"].map(full_map)
 
-        # Fallback for unseen keys
         train[col_name].fillna(global_mean, inplace=True)
         test[col_name].fillna(global_mean, inplace=True)
 
     train.drop(columns=["_key"], inplace=True)
     test.drop(columns=["_key"],  inplace=True)
+    if "_key" in src.columns:
+        src.drop(columns=["_key"], inplace=True)
 
     return train, test
 
@@ -402,7 +432,7 @@ def main():
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
     train, test = add_lag_features(train_raw, train, test)
-    train, test = add_target_encoding(train, test, kf)
+    train, test = add_target_encoding(train, test, kf, train_raw=train_raw)
     train, test = add_aggregate_stats(train, test)
     train, test, encoders = encode_categoricals(train, test)
 
