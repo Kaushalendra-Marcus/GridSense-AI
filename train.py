@@ -419,8 +419,9 @@ def add_target_encoding(train, test, cv_splits, d48_src):
     """
     print("\n[4/8] Target encoding (OOF-safe)...")
     global_mean = train["demand"].mean()
-    # Full source for test mapping includes both days
-    full_src    = pd.concat([train, d48_src], ignore_index=True)
+    # Full source for test mapping includes both days. Avoid duplicating
+    # D48 rows (train already contains D48) which would skew encodings.
+    full_src    = pd.concat([train, d48_src], ignore_index=True).drop_duplicates()
 
     encode_keys = [
         "geohash",
@@ -490,7 +491,7 @@ def encode_categoricals(train, test):
 # STEP 10 — TRAIN + PREDICT
 # ─────────────────────────────────────────────────────────────────────
 
-def train_and_predict(train, test, cv_splits, d48_src,
+def train_and_predict(train, test, cv_splits, d48_src, encoders,
                       drop_suspect_features=DROP_SUSPECT_FEATURES_FOR_TRAINING):
     print("\n[6/8] Training LightGBM (5-fold CV)...")
 
@@ -532,11 +533,30 @@ def train_and_predict(train, test, cv_splits, d48_src,
         X_tr  = X.iloc[tr_idx].copy()
         X_val = X.iloc[val_idx].copy()
 
+        # Ratios were computed on raw geohash strings. Our features are
+        # label-encoded; transform ratio indexes to encoded labels if
+        # encoders are available so mapping aligns correctly.
+        ratios_fold_enc = ratios_fold.copy()
+        p4_ratios_fold_enc = p4_ratios_fold.copy()
+        if "geohash" in encoders and len(ratios_fold) > 0:
+            try:
+                enc_idx = encoders["geohash"].transform(ratios_fold.index.astype(str))
+                ratios_fold_enc = pd.Series(ratios_fold.values, index=enc_idx)
+            except Exception:
+                # Fallback: keep original string-indexed ratios
+                pass
+        if "geo_p4" in encoders and len(p4_ratios_fold) > 0:
+            try:
+                enc_idx = encoders["geo_p4"].transform(p4_ratios_fold.index.astype(str))
+                p4_ratios_fold_enc = pd.Series(p4_ratios_fold.values, index=enc_idx)
+            except Exception:
+                pass
+
         for df_part in [X_tr, X_val]:
-            gh_ratio = df_part["geohash"].map(ratios_fold)
+            gh_ratio = df_part["geohash"].map(ratios_fold_enc)
             mask     = gh_ratio.isna()
             if mask.any():
-                gh_ratio[mask] = df_part.loc[mask, "geo_p4"].map(p4_ratios_fold)
+                gh_ratio.loc[mask] = df_part.loc[mask, "geo_p4"].map(p4_ratios_fold_enc)
             gh_ratio = gh_ratio.fillna(global_ratio_fold)
             df_part["d49_d48_ratio"]        = gh_ratio.values
             df_part["demand_d48_corrected"] = (df_part["demand_d48"] * gh_ratio).values
@@ -654,7 +674,7 @@ def main():
 
     # 11 — Train
     models, oof_preds, test_preds, feat_cols, oof_all, oof_d49 = train_and_predict(
-        train, test, cv_splits, d48_src,
+        train, test, cv_splits, d48_src, encoders,
         drop_suspect_features=DROP_SUSPECT_FEATURES_FOR_TRAINING,
     )
 
