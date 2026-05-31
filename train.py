@@ -1,30 +1,33 @@
 """
 Gridlock Hackathon 2.0 — Traffic Demand Prediction
 ====================================================
-v7 — Surgical revert of v6 regressions + clean new additions
+v8 — Analysis-driven revert + surgical improvements
 
   SCORE HISTORY:
-    v2 : 89.63  (fixed aggregate leakage + params)
-    v3 : 90.63  (D49 drift ratio, combined training, honest OOF)
-    v5 : 90.85  (lat/lon from geohash, bug fixes)
-    v6 : 90.50  !! dropped — adjacent slot iterrows added noise,
-                   D49 weight 4->3 hurt, alpha=8 over-smoothed ratio
+    v3 : 90.63  (D49 drift, combined training)
+    v5 : 90.85  (lat/lon)       <- best so far
+    v7 : 90.64  (neighbour feats hurt — redundant with existing encodings)
 
-  v7 vs v5:
-  1. Lag fallback IMPROVED: use geohash x time_slot median from D48
-     BEFORE geohash-only median.  Preserves time-of-day signal for
-     the 11.1% of test rows that miss an exact lag match.
-  2. Bayesian smoothing alpha=3 (lighter than v6's 8).
-     Only shrinks geohashes with <= 3 samples; preserves signal
-     for geohashes with decent D49 coverage.
-  3. Geo-neighbour features (fully vectorised):
-     geo_p4 x time_slot mean/std from D48  ->  gives the model a
-     spatial reference: how does this location compare to its
-     immediate neighbours at the same time of day?
-     gh_vs_p4_ratio = demand_d48 / p4_slot_mean (distinctiveness)
-  4. D49_SAMPLE_WEIGHT stays at 4 (reverting v6's 3).
-  5. colsample_bytree stays at 0.75 (reverting v6's 0.8).
-  6. Adjacent-slot features REMOVED (iterrows noise in v6).
+  ROOT CAUSE ANALYSIS from v7 terminal output:
+    OOF(all)=99.43 is meaningless — D48 self-lag = exact target value
+    OOF(D49)=95.52 vs online=90.64  -> 5-pt gap
+    Gap = D49-train (0:00-2:00) distribution != test (2:15-13:45)
+    Trees never stopped (all hit 8000) -> model still improving
+
+  v8 CHANGES vs v5 (the best baseline):
+  1. Improved lag fallback (vectorised, no iterrows):
+       geohash × time_slot median BEFORE bare geohash median.
+       Affects 11.1% of test rows, preserves time-of-day signal.
+  2. Slot-based D49 sample weights:
+       D49 slots closer to test window get higher weight.
+       Slot 0 (0:00) -> weight 2.0  |  Slot 8 (2:00) -> weight 5.0
+       Rationale: slot-8 demand patterns are more representative of
+       test slots (2:15+) and its lag R² is 0.71 vs 0.27 at slot 0.
+  3. n_estimators 8000 -> 12000  +  learning_rate 0.01 -> 0.008:
+       All folds hit 8000 trees without stopping. Model still learning.
+       More trees at lower LR = better convergence.
+  4. Neighbour features REMOVED (redundant with geo_p4_x_time_slot_enc).
+  5. Bayesian smoothing kept at alpha=3 (light, only affects <3-sample geohashes).
 
 Run:  python train.py
 Out:  outputs/submission.csv  |  models/lgbm_models.pkl
@@ -48,24 +51,29 @@ np.random.seed(42)
 # ─────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────
-DATA_DIR          = "data"
-MODEL_DIR         = "models"
-OUTPUT_DIR        = "outputs"
-SEED              = 42
-N_FOLDS           = 5
-D49_SAMPLE_WEIGHT = 4.0   # back to 4 — D49 distribution is the test target
+DATA_DIR   = "data"
+MODEL_DIR  = "models"
+OUTPUT_DIR = "outputs"
+SEED       = 42
+N_FOLDS    = 5
+
+# v8: slot-based weights computed in build_sample_weights()
+# D48 rows always weight 1.0
+# D49 rows: slot 0→2.0, slot 8→5.0 (linear ramp)
+D49_WEIGHT_MIN = 2.0
+D49_WEIGHT_MAX = 5.0
 
 LGBM_PARAMS = {
     "objective":         "regression",
     "metric":            "rmse",
-    "n_estimators":      8000,
-    "learning_rate":     0.01,
+    "n_estimators":      12000,    # v8: up from 8000 (model never stopped early)
+    "learning_rate":     0.008,    # v8: down from 0.01 (better convergence)
     "num_leaves":        127,
     "max_depth":         -1,
     "min_child_samples": 20,
     "subsample":         0.8,
     "subsample_freq":    1,
-    "colsample_bytree":  0.75,   # back to 0.75
+    "colsample_bytree":  0.75,
     "reg_alpha":         0.05,
     "reg_lambda":        0.15,
     "random_state":      SEED,
@@ -78,7 +86,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# GEOHASH DECODER  (pure Python, no external dependency)
+# GEOHASH DECODER  (pure Python)
 # ─────────────────────────────────────────────────────────────────────
 _B32MAP = {c: i for i, c in enumerate("0123456789bcdefghjkmnpqrstuvwxyz")}
 
@@ -148,7 +156,7 @@ def add_temporal_features(df):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# STEP 3 — GEO FEATURES  (prefix hierarchy + lat/lon)
+# STEP 3 — GEO FEATURES
 # ─────────────────────────────────────────────────────────────────────
 
 def add_geo_features(df, latlon_lookup):
@@ -167,7 +175,7 @@ def add_geo_features(df, latlon_lookup):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# STEP 4 — MISSING VALUE FILL  (geohash-structural from EDA)
+# STEP 4 — MISSING VALUE FILL
 # ─────────────────────────────────────────────────────────────────────
 
 def fill_missing(train, test, d48_src):
@@ -201,17 +209,38 @@ def fill_missing(train, test, d48_src):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# STEP 5 — LAG FEATURES
+# STEP 5 — SAMPLE WEIGHTS  (v8 new: slot-based D49 weighting)
 #
-# v7 improvement over v5: improved fallback chain uses geohash x slot
-# median BEFORE bare geohash median.  Affects ~11% of test rows —
-# keeps the time-of-day signal instead of discarding it.
+# D49 rows at later slots (closer to test window 2:15+) get more weight.
+# D49 slot 0 (0:00): lag R²=0.27 -> lower weight
+# D49 slot 8 (2:00): lag R²=0.71 -> higher weight
+# ─────────────────────────────────────────────────────────────────────
+
+def build_sample_weights(train):
+    d49_slots     = train["time_slot"].values
+    max_d49_slot  = 8   # D49-train goes 0..8
+    is_d49        = train["is_day49"].values == 1
+
+    # Linear ramp: slot 0 -> D49_WEIGHT_MIN, slot 8 -> D49_WEIGHT_MAX
+    slot_weight = D49_WEIGHT_MIN + (d49_slots / max_d49_slot) * (D49_WEIGHT_MAX - D49_WEIGHT_MIN)
+    slot_weight = np.clip(slot_weight, D49_WEIGHT_MIN, D49_WEIGHT_MAX)
+
+    weights = np.where(is_d49, slot_weight, 1.0)
+
+    # Print summary
+    d49_w = weights[is_d49]
+    print(f"  Sample weights — D48: 1.0  |  D49 min: {d49_w.min():.1f}  "
+          f"max: {d49_w.max():.1f}  mean: {d49_w.mean():.2f}")
+    return weights
+
+
+# ─────────────────────────────────────────────────────────────────────
+# STEP 6 — LAG FEATURES  (v8: improved fallback chain, vectorised)
 # ─────────────────────────────────────────────────────────────────────
 
 def add_lag_features(d48, d49_train, test):
     print("\n[3/9] Building lag features...")
 
-    # Pre-build lookup tables
     d48_exact   = d48.set_index(["geohash", "timestamp"])["demand"]
     gh_slot_med = d48.groupby(["geohash", "time_slot"])["demand"].median()
     gh_med      = d48.groupby("geohash")["demand"].median()
@@ -219,7 +248,7 @@ def add_lag_features(d48, d49_train, test):
     ts_med      = d48.groupby("timestamp")["demand"].median()
     global_med  = float(d48["demand"].median())
 
-    # ── D48 self-lag (proxy: same geohash × slot in D48) ─────────────
+    # D48 self-lag: geohash × slot median (same-day proxy)
     d48 = d48.copy()
     idx = pd.MultiIndex.from_arrays([d48["geohash"], d48["time_slot"]])
     d48["demand_d48"]  = gh_slot_med.reindex(idx).values
@@ -229,16 +258,15 @@ def add_lag_features(d48, d49_train, test):
     d48["demand_d48"]  = d48["demand_d48"].fillna(global_med)
     d48["is_lag_real"] = 0
 
-    # ── Real lag: D49-train + test ────────────────────────────────────
     def attach_lag(df):
         df = df.copy()
 
-        # 1. Exact geohash + timestamp
+        # 1. Exact geohash + timestamp match
         df["demand_d48"]  = [d48_exact.get((g, t), np.nan)
                              for g, t in zip(df["geohash"], df["timestamp"])]
         df["is_lag_real"] = df["demand_d48"].notna().astype(int)
 
-        # 2. v7: geohash + time_slot median (keeps time-of-day signal)
+        # 2. v8: geohash × time_slot median (keeps time-of-day signal)
         m = df["demand_d48"].isna()
         if m.any():
             idx2 = pd.MultiIndex.from_arrays([df.loc[m, "geohash"],
@@ -271,58 +299,10 @@ def add_lag_features(d48, d49_train, test):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# STEP 5b — GEO-NEIGHBOUR FEATURES  (v7 new, fully vectorised)
-#
-# For each row: mean and std of D48 demand across all geohashes
-# sharing the same geo_p4 prefix AT THE SAME time slot.
-# Also: how distinct is this geohash vs its local cluster?
-#   gh_vs_p4_ratio = demand_d48 / p4_slot_mean
-# ─────────────────────────────────────────────────────────────────────
-
-def add_neighbour_features(train, test, d48_src):
-    print("\n[3b/9] Geo-neighbour features (vectorised)...")
-
-    p4_slot_mean = (d48_src.groupby(["geo_p4", "time_slot"])["demand"]
-                    .mean().rename("p4_slot_d48_mean"))
-    p4_slot_std  = (d48_src.groupby(["geo_p4", "time_slot"])["demand"]
-                    .std().rename("p4_slot_d48_std"))
-    p5_slot_mean = (d48_src.groupby(["geo_p5", "time_slot"])["demand"]
-                    .mean().rename("p5_slot_d48_mean"))
-
-    eps = 1e-6
-    for df in [train, test]:
-        # p4 level
-        idx = pd.MultiIndex.from_arrays([df["geo_p4"], df["time_slot"]])
-        df["p4_slot_d48_mean"] = p4_slot_mean.reindex(idx).values
-        df["p4_slot_d48_std"]  = p4_slot_std.reindex(idx).values
-
-        # p5 level
-        idx5 = pd.MultiIndex.from_arrays([df["geo_p5"], df["time_slot"]])
-        df["p5_slot_d48_mean"] = p5_slot_mean.reindex(idx5).values
-
-        # Distinctiveness: how does this geohash's lag compare to its cluster?
-        df["gh_vs_p4_ratio"] = df["demand_d48"] / (df["p4_slot_d48_mean"] + eps)
-        df["gh_vs_p5_ratio"] = df["demand_d48"] / (df["p5_slot_d48_mean"] + eps)
-
-    # Fill NaNs (cold-start geohashes)
-    med = train.select_dtypes(include=[np.number]).median()
-    train = train.fillna(med)
-    test  = test.fillna(med)
-
-    print(f"  Added p4/p5 slot mean, std, and ratio features")
-    return train, test
-
-
-# ─────────────────────────────────────────────────────────────────────
-# STEP 6 — D49 DRIFT RATIO  (Bayesian-smoothed, alpha=3)
+# STEP 7 — D49 DRIFT RATIO  (Bayesian alpha=3, slot-recency weighted)
 # ─────────────────────────────────────────────────────────────────────
 
 def compute_d49_ratio(d49_rows, d48_src, clip=(0.5, 3.0), alpha=3):
-    """
-    Per-geohash D49/D48 ratio with light Bayesian smoothing (alpha=3).
-    Only geohashes with <=3 samples are noticeably shrunk toward global.
-    ALWAYS returns (ratios, p4_ratios, global_ratio) — 3 values.
-    """
     EMPTY, DEFAULT = pd.Series(dtype=float), 1.0
 
     d48_map = d48_src.set_index(["geohash", "timestamp"])["demand"]
@@ -333,7 +313,6 @@ def compute_d49_ratio(d49_rows, d48_src, clip=(0.5, 3.0), alpha=3):
     if len(matched) == 0:
         return EMPTY, EMPTY, DEFAULT
 
-    # Slot-recency weighting: slots closer to test window get higher weight
     matched["slot_weight"] = matched["time_slot"] + 1   # slots 0-8 → weights 1-9
 
     def weighted_ratio(grp):
@@ -342,21 +321,20 @@ def compute_d49_ratio(d49_rows, d48_src, clip=(0.5, 3.0), alpha=3):
         d48w = np.average(grp["demand_d48_real"].values, weights=w)
         return d49w / d48w if d48w > 1e-6 else np.nan
 
-    raw_ratios = matched.groupby("geohash").apply(weighted_ratio).dropna()
-    n_per_geo  = matched.groupby("geohash").size()
-    global_r   = float(raw_ratios.median()) if len(raw_ratios) > 0 else DEFAULT
+    raw = matched.groupby("geohash").apply(weighted_ratio).dropna()
+    n   = matched.groupby("geohash").size()
+    global_r = float(raw.median()) if len(raw) > 0 else DEFAULT
 
-    # Bayesian smoothing: (n * obs + alpha * global) / (n + alpha)
-    smoothed = {gh: (n_per_geo[gh] * r + alpha * global_r) / (n_per_geo[gh] + alpha)
-                for gh, r in raw_ratios.items()}
+    smoothed = {gh: (n[gh] * r + alpha * global_r) / (n[gh] + alpha)
+                for gh, r in raw.items()}
     ratios = pd.Series(smoothed).clip(*clip)
 
     if "geo_p4" not in matched.columns:
         matched["geo_p4"] = matched["geohash"].str[:4]
-    raw_p4  = matched.groupby("geo_p4").apply(weighted_ratio).dropna()
-    n_p4    = matched.groupby("geo_p4").size()
-    p4s = {p4: (n_p4[p4] * r + alpha * global_r) / (n_p4[p4] + alpha)
-           for p4, r in raw_p4.items()}
+    raw_p4 = matched.groupby("geo_p4").apply(weighted_ratio).dropna()
+    n_p4   = matched.groupby("geo_p4").size()
+    p4s    = {p4: (n_p4[p4] * r + alpha * global_r) / (n_p4[p4] + alpha)
+              for p4, r in raw_p4.items()}
     p4_ratios = pd.Series(p4s).clip(*clip)
 
     return ratios, p4_ratios, global_r
@@ -372,58 +350,6 @@ def attach_d49_features(df, ratios, p4_ratios, global_ratio):
     df["d49_d48_ratio"]        = gh_ratio.values
     df["demand_d48_corrected"] = df["demand_d48"] * gh_ratio.values
     return df
-
-
-# ─────────────────────────────────────────────────────────────────────
-# STEP 7 — AGGREGATE STATS  (D48 source only — zero leakage)
-# ─────────────────────────────────────────────────────────────────────
-
-def add_aggregate_stats(train, test, d48_src):
-    print("\n[5/9] Aggregate statistics (D48 source)...")
-
-    configs = [
-        ("geohash",       ["mean", "std", "median", "max", "min"]),
-        ("time_slot",     ["mean", "std"]),
-        ("geo_p4",        ["mean", "std"]),
-        ("geo_p5",        ["mean"]),
-        ("RoadType",      ["mean"]),
-        ("NumberofLanes", ["mean"]),
-        ("Weather",       ["mean"]),
-    ]
-    for key, aggs in configs:
-        stats = (d48_src.groupby(key)["demand"]
-                 .agg(aggs).add_prefix(f"{key}_d48_").reset_index())
-        train = train.merge(stats, on=key, how="left")
-        test  = test.merge(stats,  on=key, how="left")
-
-    # Geohash × test-slot (slots 9-55) stats from D48
-    ts_d48 = d48_src[d48_src["time_slot"].between(9, 55)]
-    if len(ts_d48) > 0:
-        gh_ts = (ts_d48.groupby(["geohash", "time_slot"])["demand"]
-                 .agg(["mean", "std"]).reset_index()
-                 .rename(columns={"mean": "gh_ts_d48_mean",
-                                  "std":  "gh_ts_d48_std"}))
-        p4_ts = (ts_d48.groupby(["geo_p4", "time_slot"])["demand"]
-                 .mean().reset_index()
-                 .rename(columns={"demand": "p4_ts_d48_mean"}))
-        train = train.merge(gh_ts, on=["geohash", "time_slot"], how="left")
-        test  = test.merge(gh_ts,  on=["geohash", "time_slot"], how="left")
-        train = train.merge(p4_ts, on=["geo_p4",  "time_slot"], how="left")
-        test  = test.merge(p4_ts,  on=["geo_p4",  "time_slot"], how="left")
-
-    eps = 1e-6
-    for df in [train, test]:
-        df["lag_to_geo_mean"]   = df["demand_d48"] / (df["geohash_d48_mean"] + eps)
-        df["lag_minus_geo_med"] = df["demand_d48"] - df["geohash_d48_median"]
-        df["lag_to_slot_mean"]  = df["demand_d48"] / (df["time_slot_d48_mean"] + eps)
-        df["temp_bin"]          = pd.cut(df["Temperature"],
-                                         bins=[-999, 15, 22, 30, 999],
-                                         labels=[0, 1, 2, 3]).astype(float)
-
-    med   = train.select_dtypes(include=[np.number]).median()
-    train = train.fillna(med)
-    test  = test.fillna(med)
-    return train, test
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -473,7 +399,56 @@ def add_target_encoding(train, test, kf, d48_src):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# STEP 9 — LABEL ENCODE CATEGORICALS
+# STEP 9 — AGGREGATE STATS  (D48 source only)
+# ─────────────────────────────────────────────────────────────────────
+
+def add_aggregate_stats(train, test, d48_src):
+    print("\n[5/9] Aggregate statistics (D48 source)...")
+
+    configs = [
+        ("geohash",       ["mean", "std", "median", "max", "min"]),
+        ("time_slot",     ["mean", "std"]),
+        ("geo_p4",        ["mean", "std"]),
+        ("geo_p5",        ["mean"]),
+        ("RoadType",      ["mean"]),
+        ("NumberofLanes", ["mean"]),
+        ("Weather",       ["mean"]),
+    ]
+    for key, aggs in configs:
+        stats = (d48_src.groupby(key)["demand"]
+                 .agg(aggs).add_prefix(f"{key}_d48_").reset_index())
+        train = train.merge(stats, on=key, how="left")
+        test  = test.merge(stats,  on=key, how="left")
+
+    ts_d48 = d48_src[d48_src["time_slot"].between(9, 55)]
+    if len(ts_d48) > 0:
+        gh_ts = (ts_d48.groupby(["geohash", "time_slot"])["demand"]
+                 .agg(["mean", "std"]).reset_index()
+                 .rename(columns={"mean": "gh_ts_d48_mean", "std": "gh_ts_d48_std"}))
+        p4_ts = (ts_d48.groupby(["geo_p4", "time_slot"])["demand"]
+                 .mean().reset_index().rename(columns={"demand": "p4_ts_d48_mean"}))
+        train = train.merge(gh_ts, on=["geohash", "time_slot"], how="left")
+        test  = test.merge(gh_ts,  on=["geohash", "time_slot"], how="left")
+        train = train.merge(p4_ts, on=["geo_p4",  "time_slot"], how="left")
+        test  = test.merge(p4_ts,  on=["geo_p4",  "time_slot"], how="left")
+
+    eps = 1e-6
+    for df in [train, test]:
+        df["lag_to_geo_mean"]   = df["demand_d48"] / (df["geohash_d48_mean"] + eps)
+        df["lag_minus_geo_med"] = df["demand_d48"] - df["geohash_d48_median"]
+        df["lag_to_slot_mean"]  = df["demand_d48"] / (df["time_slot_d48_mean"] + eps)
+        df["temp_bin"]          = pd.cut(df["Temperature"],
+                                         bins=[-999, 15, 22, 30, 999],
+                                         labels=[0, 1, 2, 3]).astype(float)
+
+    med   = train.select_dtypes(include=[np.number]).median()
+    train = train.fillna(med)
+    test  = test.fillna(med)
+    return train, test
+
+
+# ─────────────────────────────────────────────────────────────────────
+# STEP 10 — LABEL ENCODE CATEGORICALS
 # ─────────────────────────────────────────────────────────────────────
 
 def encode_categoricals(train, test):
@@ -491,19 +466,17 @@ def encode_categoricals(train, test):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# STEP 10 — TRAIN + PREDICT
+# STEP 11 — TRAIN + PREDICT
 # ─────────────────────────────────────────────────────────────────────
 
-def train_and_predict(train, test, kf, d48_src):
+def train_and_predict(train, test, kf, d48_src, weights):
     print("\n[6/9] Training LightGBM (5-fold CV)...")
 
     drop  = {"Index", "demand", "timestamp", "hour", "minute"}
     fcols = [c for c in train.columns if c not in drop]
     X, y  = train[fcols], train["demand"]
     Xt    = test[fcols]
-
-    weights = np.where(train["is_day49"].values == 1, D49_SAMPLE_WEIGHT, 1.0)
-    is_d49  = train["is_day49"].values == 1
+    is_d49 = train["is_day49"].values == 1
 
     print(f"  Features : {len(fcols)}")
     print(f"  D48 rows : {(~is_d49).sum()}  |  D49 rows : {is_d49.sum()}\n")
@@ -519,14 +492,13 @@ def train_and_predict(train, test, kf, d48_src):
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X)):
         t0 = time.time()
 
-        # OOF-safe ratio: recompute from training-fold D49 rows only
-        tr_df    = train.iloc[tr_idx]
-        d49_fold = tr_df[tr_df["is_day49"] == 1]
-        r_f, p4_f, g_f = compute_d49_ratio(d49_fold, d48_src)
+        # OOF-safe ratio: from training-fold D49 rows only
+        tr_d49 = train.iloc[tr_idx]
+        tr_d49 = tr_d49[tr_d49["is_day49"] == 1]
+        r_f, p4_f, g_f = compute_d49_ratio(tr_d49, d48_src)
 
         X_tr  = X.iloc[tr_idx].copy()
         X_val = X.iloc[val_idx].copy()
-
         for part in [X_tr, X_val]:
             gh_r = part["geohash"].map(r_f)
             m = gh_r.isna()
@@ -544,7 +516,7 @@ def train_and_predict(train, test, kf, d48_src):
             sample_weight=weights[tr_idx],
             eval_set=[(X_val, y.iloc[val_idx])],
             callbacks=[
-                lgb.early_stopping(400, verbose=False),
+                lgb.early_stopping(500, verbose=False),
                 lgb.log_evaluation(1000),
             ],
         )
@@ -586,7 +558,7 @@ def train_and_predict(train, test, kf, d48_src):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print("  GRIDLOCK HACKATHON 2.0 — Traffic Demand Prediction  v7")
+    print("  GRIDLOCK HACKATHON 2.0 — Traffic Demand Prediction  v8")
     print("=" * 65)
 
     train_raw, d48, d49, test = load_data()
@@ -614,23 +586,22 @@ def main():
     d48, d49, test = add_lag_features(d48, d49, test)
     train = pd.concat([d48, d49], ignore_index=True)
 
-    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-
-    print("\n[3b/9] D49 drift ratio (Bayesian alpha=3)...")
+    print("\n[3b/9] D49 drift ratio...")
     r_full, p4_full, g_full = compute_d49_ratio(d49, d48_src)
     print(f"  Global ratio : {g_full:.4f} | Geohashes : {len(r_full)}")
     train = attach_d49_features(train, r_full, p4_full, g_full)
     test  = attach_d49_features(test,  r_full, p4_full, g_full)
 
-    # v7: geo-neighbour features (before target encoding)
-    train, test = add_neighbour_features(train, test, d48_src)
-
+    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     train, test = add_target_encoding(train, test, kf, d48_src)
     train, test = add_aggregate_stats(train, test, d48_src)
     train, test, encoders = encode_categoricals(train, test)
 
+    print("\n[5b/9] Sample weights (slot-based D49 ramp)...")
+    weights = build_sample_weights(train)
+
     models, oof, test_preds, fcols, oof_all, oof_d49 = train_and_predict(
-        train, test, kf, d48_src)
+        train, test, kf, d48_src, weights)
 
     print("\n[7/9] Saving models...")
     mp = os.path.join(MODEL_DIR, "lgbm_models.pkl")
